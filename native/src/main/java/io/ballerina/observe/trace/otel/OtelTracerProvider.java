@@ -286,4 +286,18 @@ public class OtelTracerProvider implements TracerProvider {
 
         return ContextPropagators.create(W3CTraceContextPropagator.getInstance());
     }
+
+    /**
+     * Flushes the spans buffered in the batch span processor and shuts down the tracer providers.
+     * <p>
+     * The Ballerina runtime invokes this once when it is stopping, after the main function has returned and all the
+     * listeners have been gracefully stopped, so that spans of short-lived programs (including the root span of the
+     * main function) are exported before the process exits. See ballerina-platform/ballerina-lang#44894.
+     * <p>
+     * This is intentionally not annotated with {@code @Override}, since {@code TracerProvider#shutdown()} is not
+     * available in older Ballerina runtimes. On runtimes which declare it, this method overrides it.
+     */
+    public void shutdown() {
+        shutdownCurrentProvider();
+    }
 }

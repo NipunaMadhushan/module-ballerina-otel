@@ -39,15 +39,18 @@ import org.testng.annotations.Test;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertNull;
 import static org.testng.Assert.assertSame;
+import static org.testng.Assert.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -153,6 +156,91 @@ public class OtelTracerProviderTest {
             assertEquals(serviceNamesBySpan.get("payments-span"), "payments");
         } finally {
             invokeShutdownCurrentProvider();
+        }
+    }
+
+    @Test
+    public void testShutdownFlushesBufferedSpans() throws NoSuchFieldException, IllegalAccessException {
+        RecordingSpanExporter exporter = new RecordingSpanExporter();
+        initializeWithExporter(exporter);
+
+        Tracer mainTracer = tracerProvider.getTracer("main-service");
+        Tracer httpTracer = tracerProvider.getTracer("http-client");
+        httpTracer.spanBuilder("http-span").startSpan().end();
+        // The root span of the main function ends right before the runtime shuts down
+        mainTracer.spanBuilder("main-span").startSpan().end();
+
+        // No forceFlush: the spans are only queued in the batch span processor at this point
+        tracerProvider.shutdown();
+
+        List<String> exportedSpanNames = exporter.exportedSpans.stream().map(SpanData::getName).toList();
+        assertEquals(exportedSpanNames.size(), 2);
+        assertTrue(exportedSpanNames.contains("main-span"));
+        assertTrue(exportedSpanNames.contains("http-span"));
+        assertTrue(exporter.isShutdown);
+        assertNull(getStaticField("spanProcessor"));
+        assertTrue(OtelTracerProviderTest.<List<?>>getStaticField("tracerProviders").isEmpty());
+    }
+
+    @Test
+    public void testShutdownIsIdempotent() throws NoSuchFieldException, IllegalAccessException {
+        RecordingSpanExporter exporter = new RecordingSpanExporter();
+        initializeWithExporter(exporter);
+        tracerProvider.getTracer("main-service").spanBuilder("main-span").startSpan().end();
+
+        tracerProvider.shutdown();
+        tracerProvider.shutdown();
+
+        assertEquals(exporter.exportedSpans.size(), 1);
+    }
+
+    @Test
+    public void testShutdownWithoutTracers() {
+        // Tracing was never initialized, or no tracer was requested
+        tracerProvider.shutdown();
+    }
+
+    @Test(expectedExceptions = IllegalStateException.class)
+    public void testGetTracerAfterShutdownFails() throws NoSuchFieldException, IllegalAccessException {
+        initializeWithExporter(new RecordingSpanExporter());
+        tracerProvider.getTracer("main-service");
+        tracerProvider.shutdown();
+
+        // The runtime's TracersStore falls back to a no-op tracer on this error
+        tracerProvider.getTracer("another-service");
+    }
+
+    private static void initializeWithExporter(SpanExporter exporter) throws NoSuchFieldException,
+            IllegalAccessException {
+        setStaticField("spanExporter", exporter);
+        setStaticField("sampler", Sampler.alwaysOn());
+        setStaticIntField("pendingExporterTimeoutMillis", 1000);
+        setStaticIntField("pendingMaxExportBatchSize", 512);
+    }
+
+    /**
+     * Span exporter which keeps the exported spans after shutdown (unlike {@link InMemorySpanExporter}).
+     */
+    private static class RecordingSpanExporter implements SpanExporter {
+
+        private final List<SpanData> exportedSpans = new CopyOnWriteArrayList<>();
+        private volatile boolean isShutdown = false;
+
+        @Override
+        public CompletableResultCode export(Collection<SpanData> spans) {
+            exportedSpans.addAll(spans);
+            return CompletableResultCode.ofSuccess();
+        }
+
+        @Override
+        public CompletableResultCode flush() {
+            return CompletableResultCode.ofSuccess();
+        }
+
+        @Override
+        public CompletableResultCode shutdown() {
+            isShutdown = true;
+            return CompletableResultCode.ofSuccess();
         }
     }
 
